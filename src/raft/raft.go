@@ -64,6 +64,8 @@ type Raft struct {
 	currentTerm int
 	voteFor     int
 	log         []LogEntry
+	// 快照
+	snapshot []byte
 
 	// `nextIndex[i]` = 下一个要发给 peer i 的日志索引
 	nextIndex []int
@@ -72,6 +74,7 @@ type Raft struct {
 
 	// 用它把已提交日志交给上层服务
 	applyCh chan ApplyMsg
+	applyMU sync.Mutex
 
 	// Volatile state.
 	commitIndex int
@@ -117,7 +120,6 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.role = Follower
 	rf.currentTerm = term
 	rf.voteFor = -1
-	rf.resetElectionTimer()
 	rf.persist()
 }
 
@@ -126,7 +128,6 @@ func (rf *Raft) becomeCandidate() {
 	rf.role = Candidate
 	rf.currentTerm++
 	rf.voteFor = rf.me
-	rf.resetElectionTimer()
 	rf.persist()
 }
 
@@ -168,6 +169,7 @@ func (rf *Raft) logAt(index int) LogEntry {
 // startElection kicks off a RequestVote round. Caller must hold rf.mu.
 func (rf *Raft) startElection() {
 	rf.becomeCandidate()
+	rf.resetElectionTimer()
 
 	votes := 1 // vote for self
 
@@ -374,7 +376,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.voteFor)
 	e.Encode(rf.log)
-	rf.persister.Save(w.Bytes(), nil)
+	rf.persister.Save(w.Bytes(), rf.snapshot)
 }
 
 // restore previously persisted state.
@@ -406,8 +408,25 @@ func (rf *Raft) readPersist(data []byte) {
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
+// 裁剪日志、保存快照字节、把快照一并持久化
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if index <= rf.lastIncludedIndex() {
+		return
+	}
+	// 裁剪日志(截断到index，但要保留index对应的条目，将其作为新的哨兵，
+	// 其index/term即对应着lastIncludedIndex/Term)
+	// 先将全局索引转换为切片的索引
+	sliceIndex := index - rf.lastIncludedIndex()
+	newLog := make([]LogEntry, len(rf.log)-sliceIndex)
+	copy(newLog, rf.log[sliceIndex:])
+	newLog[0].Command = nil
+
+	rf.log = newLog
+	rf.snapshot = snapshot
+	rf.persist()
 }
 
 // example RequestVote RPC arguments structure.
@@ -447,9 +466,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			// 日志落后但任期更高的节点会不停发 RequestVote（它永远选不上），
 			// 若每次都重置别人的计时器，集群将长期无人能超时发起选举。
 			// 论文 Figure 2 中计时器只在收到 AppendEntries 时重置。
-			rf.role = Follower
-			rf.currentTerm = args.Term
-			rf.voteFor = -1
+			rf.becomeFollower(args.Term)
 			rf.persist()
 		}
 		// Grant only if the candidate's log is at least as up-to-date as ours.
@@ -504,6 +521,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	} else if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
+		rf.resetElectionTimer()
 	} else {
 		// 若清空状态回退到follower，会丢失voteFor
 		// 若同一时刻有个candidate还未收到leader的心跳，向该回退的follower请求了投票，
@@ -571,6 +589,88 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 
+
+// InstallSnapshot RPC arguments.For 3D
+// Leader 把快照发给严重落后的 Follower 的 RPC 定义和发送辅助函数。
+// 用于解决“Follower 需要的日志已经被 Leader 丢弃”的问题。
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	reply.Term = rf.currentTerm
+
+	if rf.role == Dead {
+		return
+	}
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	} else if args.Term > rf.currentTerm {
+		rf.becomeFollower(args.Term)
+		rf.resetElectionTimer()
+	} else {
+		rf.role = Follower
+		rf.resetElectionTimer()
+	}
+
+	// 该节点已经有更新的快照了，不是落后的节点
+	if args.LastIncludedIndex <= rf.lastIncludedIndex() {
+		reply.Term = rf.currentTerm
+		return
+	}
+	// 该节点有更新的快照，需要安装
+
+	// 快照索引在本端日志范围内且任期一致 → 直接保留其后的日志后缀
+	keepSuffix := args.LastIncludedIndex <= rf.lastLogIndex() &&
+		rf.logAt(args.LastIncludedIndex).Term == args.LastIncludedTerm
+
+	if keepSuffix {
+		offset := args.LastIncludedIndex - rf.lastIncludedIndex()
+		newLog := make([]LogEntry, len(rf.log) - offset)
+		copy(newLog, rf.log[offset:])
+		newLog[0].Command = nil
+
+		rf.log = newLog
+	} else {
+		// 快照索引不在本端日志范围内或任期不一致志 → 整个日志只剩快照哨兵
+		rf.log = []LogEntry{{Term: args.LastIncludedTerm, Index: args.LastIncludedIndex}}
+	}
+
+	rf.snapshot = args.Data
+	if rf.commitIndex < args.LastIncludedIndex {
+		rf.commitIndex = args.LastIncludedIndex
+	}
+	if rf.lastApplied < args.LastIncludedIndex {
+		rf.lastApplied = args.LastIncludedIndex
+	}
+	rf.persist()
+
+	msg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+
+	}
+	rf.mu.Unlock()
+
+	rf.applyMU.Lock()
+	rf.applyCh <- msg
+	rf.applyMU.Unlock()
+}
+
+
+
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -596,6 +696,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	return rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -681,6 +785,8 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) applyLoop() {
 	for !rf.killed() {
+		rf.applyMU.Lock()
+
 		rf.mu.Lock()
 		if rf.lastApplied >= rf.commitIndex {
 			rf.mu.Unlock()
@@ -707,6 +813,9 @@ func (rf *Raft) applyLoop() {
 		for _, msg := range batch {
 			rf.applyCh <- msg // 持锁期间绝不能发 applyCh！通道可能阻塞
 		}
+
+
+		rf.applyMU.Unlock()
 	}
 }
 
@@ -737,8 +846,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = make([]LogEntry, 0, 16)
 	rf.log = append(rf.log, LogEntry{Term: 0, Index: 0})
 
+	// initialize from snapshot persisted before a crash
+	rf.snapshot = persister.ReadSnapshot()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	// 对齐 commitIndex 和 lastApplied 到快照索引。
+	// ‘必须在 readPersist 之后：恢复出的 log[0].Index 才是快照索引。
+	// 快照索引 即 被裁减的最后一个日志索引。
+	// 快照只可能对已提交且已应用的日志生成。
+	// 日志能被裁减，说明日志已提交，可应用。’
+	rf.commitIndex = rf.lastIncludedIndex()
+	rf.lastApplied = rf.lastIncludedIndex()
 
 	// start the single ticker goroutine to drive elections and heartbeats
 	go rf.ticker()
