@@ -8,6 +8,9 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	ClientID int64
+	RequestID int64
+	leaderID int
 }
 
 func nrand() int64 {
@@ -21,6 +24,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.ClientID = nrand()
+	ck.RequestID = 0
+	ck.leaderID = 0
 	return ck
 }
 
@@ -37,7 +43,30 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{
+		Key: key,
+		ClientID: ck.ClientID,
+		RequestID: ck.RequestID,
+	}
+	for {
+		reply := GetReply{}
+
+		if ok := ck.servers[ck.leaderID].Call("KVServer.Get", &args, &reply); !ok{
+			ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
+			continue;
+		}
+
+		switch reply.Err {
+		case OK:
+			ck.RequestID++
+			return reply.Value
+		case ErrNoKey:
+			ck.RequestID++
+			return ""
+		case ErrWrongLeader:
+			ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
+		}
+	}
 }
 
 // shared by Put and Append.
@@ -50,6 +79,29 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key:   key,
+		Value: value,
+		Op:    op,
+		ClientID: ck.ClientID,
+		RequestID: ck.RequestID,
+	}
+	for {
+		reply := PutAppendReply{}
+
+		if ok := ck.servers[ck.leaderID].Call("KVServer."+op, &args, &reply); !ok{
+			ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
+			continue;
+		}
+
+		switch reply.Err {
+		case OK, ErrNoKey:
+			ck.RequestID++
+			return
+		case ErrWrongLeader:
+			ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
