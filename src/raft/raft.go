@@ -74,6 +74,8 @@ type Raft struct {
 
 	// 用它把已提交日志交给上层服务
 	applyCh chan ApplyMsg
+	//串行化 applyCh 投递，保证快照与日志消息按索引顺序到达上层
+	//因为往`applyCh` 里写消息的 有两个 goroutine ，而它们之间没有先后约束，所以需要串行化，避免消息乱序
 	applyMU sync.Mutex
 
 	// Volatile state.
@@ -225,6 +227,11 @@ func (rf *Raft) runHeartbeats() {
 }
 
 func (rf *Raft) replicateLog(server int) {
+	// 将要发给目标节点的索引小于等于快照索引，说明已经裁剪了，需要发送快照
+	if rf.nextIndex[server] <= rf.lastIncludedIndex() {
+		rf.sendSnapshot(server)
+		return
+	}
 	nextIndex := rf.nextIndex[server]
 	prevLogIndex := nextIndex - 1
 	prevLogTerm := rf.logAt(prevLogIndex).Term
@@ -331,18 +338,24 @@ func (rf *Raft) replicateLog(server int) {
 				}
 			}
 			// 边界保护：必须落在 [1, lastLogIndex+1]
-			if next < rf.lastIncludedIndex()+1 {
-				next = rf.lastIncludedIndex() + 1 // 0处非日志（哨兵），不能回退
+			// 有了快照，快退下界必须从`lastIncludedIndex()+1` 放宽到`lastIncludedIndex()`
+
+			// 假设follower日志过短，返回Xlen，next=Xlen < rf.lastIncludedIndex() + 1
+			// next = rf.lastIncludedIndex() + 1
+			// 在判断是否需要发快照的条件中，next > lastIncludedIndex()，无法触发快照
+			// 再次返回Xlen，导致永远在 Xlen 和 lastIncludedIndex() + 1 之间打转，一条日志都发不出去
+			if next < rf.lastIncludedIndex() {
+				next = rf.lastIncludedIndex() // 0处非日志（哨兵）
 			}
 			if next > rf.lastLogIndex()+1 {
 				next = rf.lastLogIndex() + 1 // Entry为空，纯心跳
 			}
 
 			// 避免信息异常时死循环
-			if next >= rf.nextIndex[server] {
+			if next == rf.nextIndex[server] {
 				next = rf.nextIndex[server] - 1
-				if next < rf.lastIncludedIndex()+1 {
-					next = rf.lastIncludedIndex() + 1
+				if next < rf.lastIncludedIndex() {
+					next = rf.lastIncludedIndex()
 				}
 			}
 
@@ -352,6 +365,37 @@ func (rf *Raft) replicateLog(server int) {
 			// 下一轮心跳会带着修正后的 nextIndex 重试，足够快。
 		}
 	}(server)
+}
+
+func (rf *Raft) sendSnapshot(server int) {
+	args := &InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.lastIncludedIndex(),
+		LastIncludedTerm:  rf.logAt(rf.lastIncludedIndex()).Term,
+		Data:              rf.snapshot,
+	}
+	term := rf.currentTerm
+	go func() {
+		reply := &InstallSnapshotReply{}
+		if !rf.sendInstallSnapshot(server, args, reply) {
+			return
+		}
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if rf.role != Leader || rf.currentTerm != term {
+			return
+		}
+		if reply.Term > rf.currentTerm {
+			rf.becomeFollower(reply.Term)
+			return
+		}
+		// 快照已被 follower 接受 → 视为该点已匹配,更新 matchIndex 和 nextIndex
+		if args.LastIncludedIndex > rf.matchIndex[server] {
+			rf.matchIndex[server] = args.LastIncludedIndex
+		}
+		rf.nextIndex[server] = args.LastIncludedIndex + 1
+	}()
 }
 
 // return currentTerm and whether this server
@@ -408,6 +452,7 @@ func (rf *Raft) readPersist(data []byte) {
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
+// 上层服务 → Raft ，通知“我已经把状态压缩到 index 了，你可以裁剪日志”
 // 裁剪日志、保存快照字节、把快照一并持久化
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
@@ -538,6 +583,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ConflictIndex = rf.lastLogIndex() + 1 // XLen：全局索引，不能用 len(log)
 		return
 	}
+	if args.PrevLogIndex < rf.lastIncludedIndex() {
+		// 快照已经越过 leader 的探测点：让 leader 从快照之后继续
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = rf.lastIncludedIndex() + 1
+		return
+	}
 	if args.PrevLogTerm != rf.logAt(args.PrevLogIndex).Term {
 		conflictTerm := rf.logAt(args.PrevLogIndex).Term
 		// index     1 2 3 4 5
@@ -589,7 +640,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 
-
 // InstallSnapshot RPC arguments.For 3D
 // Leader 把快照发给严重落后的 Follower 的 RPC 定义和发送辅助函数。
 // 用于解决“Follower 需要的日志已经被 Leader 丢弃”的问题。
@@ -610,10 +660,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.currentTerm
 
 	if rf.role == Dead {
+		rf.mu.Unlock()
 		return
 	}
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
 		return
 	} else if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
@@ -626,6 +678,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// 该节点已经有更新的快照了，不是落后的节点
 	if args.LastIncludedIndex <= rf.lastIncludedIndex() {
 		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
 		return
 	}
 	// 该节点有更新的快照，需要安装
@@ -636,7 +689,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	if keepSuffix {
 		offset := args.LastIncludedIndex - rf.lastIncludedIndex()
-		newLog := make([]LogEntry, len(rf.log) - offset)
+		newLog := make([]LogEntry, len(rf.log)-offset)
 		copy(newLog, rf.log[offset:])
 		newLog[0].Command = nil
 
@@ -654,13 +707,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.lastApplied = args.LastIncludedIndex
 	}
 	rf.persist()
+	// follower 收到 leader 的`InstallSnapshot` 时，本地日志可能整个被替换/裁剪，
+	// 被裁掉的那段命令 永远不会再以`CommandValid` 的形式发出来 （日志里已经没有了）。
+	// 上层必须知道“你缺的那段历史已经被这份快照覆盖了”，所以需要第二种消息
 
+	//本质上是 通知上层服务： “这部分历史我用一份整体快照替代了，请直接接受它作为你的新起点
 	msg := ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.Data,
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
-
 	}
 	rf.mu.Unlock()
 
@@ -668,8 +724,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.applyCh <- msg
 	rf.applyMU.Unlock()
 }
-
-
 
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -790,6 +844,7 @@ func (rf *Raft) applyLoop() {
 		rf.mu.Lock()
 		if rf.lastApplied >= rf.commitIndex {
 			rf.mu.Unlock()
+			rf.applyMU.Unlock()               // 必须先放锁：Mutex 不可重入，否则下一轮 Lock 永久阻塞
 			time.Sleep(10 * time.Millisecond) // 空闲时才歇，避免忙等
 			continue
 		}
@@ -813,7 +868,6 @@ func (rf *Raft) applyLoop() {
 		for _, msg := range batch {
 			rf.applyCh <- msg // 持锁期间绝不能发 applyCh！通道可能阻塞
 		}
-
 
 		rf.applyMU.Unlock()
 	}
