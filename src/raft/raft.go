@@ -41,6 +41,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 3D:
 	SnapshotValid bool
@@ -656,6 +657,12 @@ type InstallSnapshotReply struct {
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	// 先拿 applyMU 再进 rf.mu，与 applyLoop 的锁序保持一致。
+	// 否则在“检查 lastApplied”与“投递快照消息”之间，applyLoop 可能把更高索引的条目
+	// 先送入 applyCh，导致快照消息反而排在它们之后，上层状态机被旧快照回滚。
+	rf.applyMU.Lock()
+	defer rf.applyMU.Unlock()
+
 	rf.mu.Lock()
 	reply.Term = rf.currentTerm
 
@@ -676,7 +683,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	// 该节点已经有更新的快照了，不是落后的节点
-	if args.LastIncludedIndex <= rf.lastIncludedIndex() {
+	// 同时，如果本端状态机已经应用到了 snapshot 索引之后（lastApplied >= LastIncludedIndex），
+	// 说明快照覆盖的历史本端早已执行过；此时若整体替换状态机会把已执行的新状态抹掉，
+	// 且那些条目已从日志中移除无法重放，必须忽略这份旧快照。
+	if args.LastIncludedIndex <= rf.lastIncludedIndex() ||
+		args.LastIncludedIndex <= rf.lastApplied {
 		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
 		return
@@ -720,9 +731,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	rf.mu.Unlock()
 
-	rf.applyMU.Lock()
+	// applyMU 仍在持有中，保证快照消息与日志循环的投递严格串行
 	rf.applyCh <- msg
-	rf.applyMU.Unlock()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -789,6 +799,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 	rf.persist()
+	go rf.runHeartbeats() // 有新日志时立刻复制，不等下一轮心跳
 	return index, term, isLeader
 }
 
@@ -859,6 +870,7 @@ func (rf *Raft) applyLoop() {
 			batch = append(batch, ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
+				CommandTerm:  entry.Term,
 				CommandIndex: entry.Index,
 			})
 		}

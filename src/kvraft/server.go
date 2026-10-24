@@ -4,10 +4,11 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
-	"log"
 )
 
 const Debug = false
@@ -21,16 +22,20 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	ClientID int64
+	ClientID  int64
 	RequestID int64
-	OpType string
-	Key string
-	Value string
+	OpType    string
+	Key       string
+	Value     string
+}
+
+type SnapshotData struct {
+	KvStore       map[string]string
+	RequestCookie map[int64]int64
 }
 
 type KVServer struct {
@@ -43,27 +48,60 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kvStore map[string]string
-	requestCookie map[int64]int64 // 每个client最近一次请求的requestID
-	waitChMap      map[int]chan *Op  //通知chan，key为日志的下标，值为通道
+	kvStore       map[string]string
+	requestCookie map[int64]int64  // 每个client最近一次请求的requestID
+	waitChMap     map[int]chan *Op //通知chan，key为日志的下标，值为通道
+
+	persister *raft.Persister
+	lastIncludedIndex int
 }
 
+func (kv *KVServer) encodeSnapshot() []byte {
+	w := bytes.NewBuffer(nil)
+	e := labgob.NewEncoder(w)
+	e.Encode(SnapshotData{
+		KvStore:       kv.kvStore,
+		RequestCookie: kv.requestCookie,
+	})
+	return w.Bytes()
+}
+
+func (kv *KVServer) decodeSnapshot(snapshot []byte) {
+	if len(snapshot) == 0 {
+		return
+	}
+	r := bytes.NewReader(snapshot)
+	d := labgob.NewDecoder(r)
+	var data SnapshotData
+	if err := d.Decode(&data); err != nil {
+		return
+	}
+	kv.kvStore = data.KvStore
+	kv.requestCookie = data.RequestCookie
+	if kv.kvStore == nil {
+		kv.kvStore = make(map[string]string)
+	}
+	if kv.requestCookie == nil {
+		kv.requestCookie = make(map[int64]int64)
+	}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	op := Op{
-		ClientID: args.ClientID,
+		ClientID:  args.ClientID,
 		RequestID: args.RequestID,
-		OpType: "Get",
-		Key: args.Key,
+		OpType:    "Get",
+		Key:       args.Key,
 	}
+	kv.mu.Lock()
 	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
+		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
 		return
 	}
 
-	kv.mu.Lock()
 	waitChan, exist := kv.waitChMap[index]
 	if !exist {
 		kv.waitChMap[index] = make(chan *Op, 1)
@@ -100,22 +138,22 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			return
 		}
 	}
-	kv.mu.Unlock()
 
 	op := Op{
-		ClientID: args.ClientID,
+		ClientID:  args.ClientID,
 		RequestID: args.RequestID,
-		OpType: args.Op,
-		Key: args.Key,
-		Value: args.Value,
+		OpType:    args.Op,
+		Key:       args.Key,
+		Value:     args.Value,
 	}
+
 	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
+		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
 		return
 	}
 
-	kv.mu.Lock()
 	waitChan, exist := kv.waitChMap[index]
 	if !exist {
 		kv.waitChMap[index] = make(chan *Op, 1)
@@ -143,8 +181,6 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.PutAppend(args, reply)
 }
-
-
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
@@ -175,17 +211,32 @@ func (kv *KVServer) applyChListener() {
 	for !kv.killed() {
 		applyMsg := <-kv.applyCh
 		kv.mu.Lock()
+
 		if applyMsg.CommandValid {
+			if applyMsg.CommandIndex <= kv.lastIncludedIndex {
+				kv.mu.Unlock()
+				continue
+			}
 			op := applyMsg.Command.(Op)
 			kv.execute(&op)
 			currentTerm, stillLeader := kv.rf.GetState()
 			if currentTerm == applyMsg.CommandTerm && stillLeader {
 				kv.notifyWaitCh(applyMsg.CommandIndex, &op)
 			}
+			if kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate {
+				snapshot := kv.encodeSnapshot()
+				kv.rf.Snapshot(applyMsg.CommandIndex, snapshot)
+			}
+			kv.lastIncludedIndex = applyMsg.CommandIndex
 		} else if applyMsg.SnapshotValid {
-
+			if applyMsg.SnapshotIndex <= kv.lastIncludedIndex {
+				kv.mu.Unlock()
+				continue
+			}
+			kv.decodeSnapshot(applyMsg.Snapshot)
+			kv.lastIncludedIndex = applyMsg.SnapshotIndex
 		}
-		
+
 		kv.mu.Unlock()
 	}
 }
@@ -194,24 +245,20 @@ func (kv *KVServer) applyChListener() {
 func (kv *KVServer) execute(op *Op) {
 	if op.OpType == "Get" {
 		op.Value = kv.kvStore[op.Key]
-	} else {
-		if lastRequestID, ok := kv.requestCookie[op.ClientID]; ok {
-			if op.RequestID <= lastRequestID {
-				return
-			}
-			if op.OpType == "Put" {
-				kv.kvStore[op.Key] = op.Value
-			} else if op.OpType == "Append" {
-				kv.kvStore[op.Key] = kv.kvStore[op.Key] + op.Value
-			}
-		}
+		return
 	}
-	lastRequestID, ok := kv.requestCookie[op.ClientID]
-	if !ok {
-		kv.requestCookie[op.ClientID] = op.RequestID
-	} else {
-		kv.requestCookie[op.ClientID] = Max(lastRequestID, op.RequestID)
+
+	// 只对 Put/Append 去重：第一次见到该 client 时必须执行
+	if last, ok := kv.requestCookie[op.ClientID]; ok && op.RequestID <= last {
+		return // 重传的旧请求，直接忽略
 	}
+
+	if op.OpType == "Put" {
+		kv.kvStore[op.Key] = op.Value
+	} else if op.OpType == "Append" {
+		kv.kvStore[op.Key] = kv.kvStore[op.Key] + op.Value
+	}
+	kv.requestCookie[op.ClientID] = op.RequestID
 }
 
 func Max(a, b int64) int64 {
@@ -221,7 +268,6 @@ func Max(a, b int64) int64 {
 	return b
 }
 
-
 // 给waitCh发送通知，让其生成响应
 // 在发送之前需要检查waitCh是否关闭
 func (kv *KVServer) notifyWaitCh(index int, op *Op) {
@@ -229,7 +275,6 @@ func (kv *KVServer) notifyWaitCh(index int, op *Op) {
 		waitCh <- op
 	}
 }
-
 
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -253,6 +298,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.persister = persister
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -261,7 +307,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kvStore = make(map[string]string)
 	kv.requestCookie = make(map[int64]int64)
 	kv.waitChMap = make(map[int]chan *Op)
-	
+
+	kv.decodeSnapshot(kv.persister.ReadSnapshot())
+
 	go kv.applyChListener()
 
 	return kv
